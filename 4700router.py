@@ -1,5 +1,5 @@
 import argparse, socket, time, json, select, struct, sys, math
-
+from utils import Math
 class Router:
 
     relations = {}
@@ -31,15 +31,70 @@ class Router:
             socks = select.select(self.sockets.values(), [], [], 0.1)[0]
             for conn in socks:
                 k, addr = conn.recvfrom(65535)
+                message = json.loads(k.decode('utf-8'))
+                msg_type = message["type"]
+
                 srcif = None
                 for sock in self.sockets:
                     if self.sockets[sock] == conn:
                         srcif = sock
                         break
-                msg = k.decode('utf-8')
+
+                if msg_type == 'update':
+                    self.update(message, scrif)
+                elif msg_type == 'data':
+                    self.data(message)
+                elif msg_type == 'withdraw':
+                    self.withdraw(message)
+                elif msg_type == 'dump':
+                    self.dump(message)
 
                 print("Received message '%s' from %s" % (msg, srcif))
         return
+
+    def update(self, message, srcif):
+        payload = message["msg"]
+
+        network = Math.ip_to_number(payload["network"])
+        netmask = payload["netmask"]
+        ASPath = payload["ASPath"]
+        loalpref = payload["localpref"]
+        origin = payload["origin"]
+        selfOrigin = payload["selfOrigin"]
+
+        self.table.append({
+            "network": network, 
+            "netmask": netmask, 
+            "localpref": loalpref,
+            "selfOrigin": selfOrigin,
+            "ASPath": ASPath, 
+            "origin": origin
+            })
+
+        foward_message = {}
+
+        for neighbor in self.sockets:
+            if neighbor != srcif:
+                self.send(neighbor, json.dumps({ "type": "update", "src": self.our_addr(neighbor), "dst": neighbor, "msg": payload  }))
+
+    def data(self, message, scrif): 
+        pass 
+
+    def withdraw(self, message, scrif): 
+        pass
+
+    def dump(self, message, scrif): 
+        pass
+
+    
+
+
+
+
+
+
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='route packets')
