@@ -1,14 +1,14 @@
 class Math: 
     @staticmethod 
     def ip_to_number(ip_addy):
-        split_number = ip_addy.split('.')
+            split_numbers = ip_addy.split('.')
 
-        first_octet = split_numbers[0] << 24
-        second_octet = split_numbers[1] << 16
-        third_octet = split_numbers[2] << 8
-        fourth_octet = split_numbers[3]
+            first_octet = int(split_numbers[0]) << 24
+            second_octet = int(split_numbers[1]) << 16
+            third_octet = int(split_numbers[2]) << 8
+            fourth_octet = int(split_numbers[3])
 
-        return first_octet + second_octet + third_octet + fourth_octet
+            return first_octet + second_octet + third_octet + fourth_octet
 
     @staticmethod
     def number_to_ip(ip_number):

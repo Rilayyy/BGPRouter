@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+import argparse, socket, time, json, select, struct, sys, math
+from utils import Math
+class Router:
+
+    relations = {}
+    sockets = {}
+    ports = {}
+
+    def __init__(self, asn, connections):
+        print("Router at AS %s starting up" % asn)
+        self.asn = asn
+        self.table = []
+
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+
+            self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(('localhost', 0))
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+            self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}  }))
+
+    def our_addr(self, dst):
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+    def send(self, network, message):
+        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
+
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)
+                message = json.loads(k.decode('utf-8'))
+                msg_type = message["type"]
+
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+
+                if msg_type == 'update':
+                    self.update(message, srcif)
+                elif msg_type == 'data':
+                    self.data(message, srcif)
+                elif msg_type == 'withdraw':
+                    self.withdraw(message, srcif)
+                elif msg_type == 'dump':
+                    self.dump(message, srcif)
+
+                print("Received message '%s' from %s" % (message, srcif))
+        return
+
+    def _create_route_entry(self, payload, peer_ip):
+        network_int = Math.ip_to_number(payload["network"])
+        netmask_int = Math.ip_to_number(payload["netmask"])
+
+        return { 
+            "network": network_int, 
+            "netmask": netmask_int, 
+            "localpref": payload["localpref"],
+            "selfOrigin": payload["selfOrigin"],
+            "ASPath": payload["ASPath"], 
+            "origin": payload["origin"],
+            "peer": peer_ip,
+        }
+
+    def update(self, message, srcif):
+        """
+        Updates the routing table and currently broadcasts non private info to all neighbors
+        :params message: The message
+        :params scrif: the IP of the neighbor who sent us the message
+        """
+        new_route = self._create_route_entry(message["msg"], srcif)
+        self.table.append(new_route)
+
+        foward_message = {
+            "network": message["msg"]["network"],
+            "netmask": message["msg"]["netmask"],
+            "ASPath": [self.asn] + new_route["ASPath"]
+        }
+
+        # Update later currently broadcasts to all neigbors but needs to decide neightbors or customers later
+        for neighbor in self.sockets:
+            if neighbor != srcif:
+                self.send(neighbor, json.dumps({ "type": "update", "src": self.our_addr(neighbor), "dst": neighbor, "msg": foward_message}))
+
+    def data(self, message, srcif): 
+
+        dst = Math.ip_to_number(message["dst"])
+        src = message["src"]
+        payload = message["msg"]
+
+        for route in self.table:
+            if Math.prefix_match(dst, route["network"], route["netmask"]):
+                self.send(route['peer'], json.dumps(message))
+                return
+        
+        self.send(srcif, json.dumps({ "type": "no route", "src": self.our_addr(srcif), "dst": message["src"], "msg": {}}))
+    def withdraw(self, message, srcif): 
+        revoked_routes = message["msg"]
+
+        for revoked in revoked_routes:
+            target_network = Math.ip_to_number(revoked["network"])
+            target_netmask = Math.ip_to_number(revoked["netmask"])
+
+            updated_table = []
+
+            for route in self.table: 
+                is_same_network = (route["network"] == target_network)
+                is_same_netmask = (route["netmask"] == target_netmask)
+                is_same_peer = (route["peer"] == srcif)
+
+                if not (is_same_network and is_same_netmask and is_same_peer):
+                    updated_table.append(route)
+
+            self.table = updated_table
+
+        for neighbor in self.sockets:
+            if neighbor != srcif:
+                self.send(neighbor, json.dumps({ "type": "withdraw", "src": self.our_addr(neighbor), "dst": neighbor, "msg": revoked_routes}))
+
+    def dump(self, message, srcif): 
+            string_table = []
+
+            for route in self.table: 
+                string_route = {
+                    "network": Math.number_to_ip(route["network"]), 
+                    "netmask": Math.number_to_ip(route["netmask"]),
+                    "localpref": route["localpref"],
+                    "selfOrigin": route["selfOrigin"],
+                    "ASPath": route["ASPath"], 
+                    "origin": route["origin"],
+                    "peer": route["peer"],
+                }
+                string_table.append(string_route)
+
+            self.send(srcif, json.dumps({ "type": "table", "src": self.our_addr(srcif), "dst": srcif, "msg": string_table}))
+        
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='route packets')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
+    args = parser.parse_args()
+    router = Router(args.asn, args.connections)
+    router.run()
