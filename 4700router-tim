@@ -1,0 +1,207 @@
+#!/usr/bin/env -S python3 -u
+import argparse, socket, time, json, select, struct, sys, math
+
+class Router:
+    # keeps information about AS neighbors
+    relations = {}
+    sockets = {}
+    ports = {}
+
+
+    # initializes our BGP router
+    def __init__(self, asn, connections):
+        print("Router at AS %s starting up" % asn)
+        self.asn = asn
+        self.forwarding_table = []
+
+        # update the neighbors information for each connection, and send handshake
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+
+            self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(('localhost', 0))
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+            self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}  }))
+
+    # takes a destination ip and produces an identical source ip, except the last octet is 1 to represent our router
+    def our_addr(self, dst):
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+    # takes an ip and converts it to an integer
+    def ip_to_int(self, ip):
+        quads = list(int(qdn) for qdn in ip.split('.'))
+        
+        # add the integers together with appropriate bit shift
+        return (quads[0] << 24) + (quads[1] << 16) + (quads[2] << 8) + quads[3]
+
+    # sends a specified message to a given AS neighbor
+    def send(self, network, message):
+        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
+
+    # actively receives messages from neighbor AS's
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+
+            # for each socket, listen for messages
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+
+                msg = json.loads(k.decode('utf-8'))
+
+                self.process_message(srcif, msg)
+
+                print("Received message '%s' from %s" % (msg, srcif))
+        return
+
+
+    # decides which neighbors to contact based off of our relationship with the sender and our neighbors
+    def contact_neighbors(self, sender, announcement):
+      # rules:
+      # - 1) Update received from a customer: send updates to all other neighbors
+      # - 2) Update received from a peer or a provider: only send updates to your customers
+
+      # for every neighbor
+      for neighbor in self.relations:
+
+        # don't send the sender the info they sent us
+        if (neighbor == sender):
+          continue
+
+        # for every neighbor, send them the update IF they are:
+        # - either a customer (rule 2 - customer gets all info)
+        # - or the sender is a customer (rule 1 - all customer updates get sent to everyone)
+
+        if ((self.relations[sender] == "cust") or (self.relations[neighbor] == "cust")):
+          self.send(neighbor, json.dumps({"type": "update", "src": self.our_addr(neighbor), "dst": neighbor, "msg": announcement }))
+
+
+    # decides which functions to call based on the message
+    def process_message(self, sender, msg):
+      if msg['type'] == "update":
+        return self.handle_updating(sender, msg)
+
+      elif msg['type'] == "data":
+        return self.handle_data(sender, msg)
+
+      elif msg['type'] == "withdraw":
+        return
+
+      elif msg['type'] == "dump":
+        return self.handle_dump(sender)
+
+
+    # handles updating forwarding table based on recieved information
+    def handle_updating(self, sender, msg):
+
+      # create a forwarding table row from the message contents (this holds private info)
+      private_announcement = {
+          "origin": msg["msg"]["origin"],
+          "localpref": msg["msg"]["localpref"],
+          "network": msg["msg"]["network"],
+          "ASPath": msg["msg"]["ASPath"],
+          "netmask": msg["msg"]["netmask"],
+          "selfOrigin": msg["msg"]["selfOrigin"],
+          "peer": sender
+      }
+
+      # add the row to the existing table
+      self.forwarding_table.append(private_announcement)
+
+      # this is the public version of the private update - with private information removed (and our router added to the path)
+      public_announcement = {
+          "network": msg["msg"]["network"],
+          "netmask": msg["msg"]["netmask"],
+          "ASPath": [self.asn] + msg["msg"]["ASPath"],
+      }
+
+      # decide who to share this with
+      self.contact_neighbors(sender, public_announcement)
+    
+    # sends our forwarding table to the sender
+    def handle_dump(self, sender):
+      self.send(sender, json.dumps({"type": "table", "src": self.our_addr(sender), "dst": sender, "msg": self.forwarding_table }))
+
+    # handles forwarding of data messages to neighbors based on forwarding table
+    def handle_data(self, sender, msg):
+
+      best_match = None
+      best_netmask = -1
+
+      # for every possible route in our forwarding table
+      for possible in self.forwarding_table:
+        network = self.ip_to_int(possible["network"])
+        netmask = self.ip_to_int(possible["netmask"])
+        destination = self.ip_to_int(msg["dst"])
+
+        # if the destination is is this network
+        if ((destination & netmask) == (network & netmask)):
+          # save the best match
+          # rules:
+          # 1) The entry with the longest (most specific) netmask wins. If netmasks are equal...
+          # 2) The entry with the highest localpref wins. If the localprefs are equal…
+          # 3) The entry with selfOrigin as true wins. If all selfOrigins are the equal…
+          # 4) The entry with the shortest ASPath wins. If multiple entries have the shortest length…
+          # 5) The entry with the best origin wins, where IGP > EGP > UNK. If multiple entries have the best origin…
+          # 6) The entry from the neighbor router (i.e., the src of the update message) with the lowest IP address.
+
+          # rule 1
+          if (best_netmask < netmask):
+            best_netmask = netmask
+            best_match = possible
+
+          elif (best_netmask == netmask):
+            # rule 2
+            if (best_match["localpref"] < possible["localpref"]):
+              best_netmask = netmask
+              best_match = possible
+            elif (best_match["localpref"] == possible["localpref"]):
+              # rule 3
+              if (best_match["selfOrigin"] < possible["selfOrigin"]):
+                best_netmask = netmask
+                best_match = possible
+                
+              elif (best_match["selfOrigin"] == possible["selfOrigin"]):
+                # rule 4
+                if (len(best_match["ASPath"]) > len(possible["ASPath"])):
+                  best_netmask = netmask
+                  best_match = possible
+                
+                elif (len(best_match["ASPath"]) == len(possible["ASPath"])):
+                  # rule 5
+                  origin_ranks = {"IGP": 3, "EGP": 2, "UNK": 1}
+
+                  if (origin_ranks[best_match["origin"]] < origin_ranks[possible["origin"]]):
+                    best_netmask = netmask
+                    best_match = possible
+
+                  elif (origin_ranks[best_match["origin"]] == origin_ranks[possible["origin"]]):
+                    # rule 6
+                    if (ip_to_int(best_netmask["peer"]) > ip_to_int(possible["peer"])):
+                      best_netmask = netmask
+                      best_match = possible
+      
+      # if a best path exists forward the message, otherwise send no route message to sender
+      if (best_match):
+        self.send(best_match["peer"], json.dumps(msg))
+      else:
+        self.send(sender, json.dumps({"type": "no route", "src": self.our_addr(sender), "dst": sender, "msg": {} }))
+
+
+
+# command line parser, used to create the router
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='route packets')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
+    args = parser.parse_args()
+    router = Router(args.asn, args.connections)
+    router.run()
