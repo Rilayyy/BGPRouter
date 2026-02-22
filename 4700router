@@ -7,12 +7,12 @@ class Router:
     sockets = {}
     ports = {}
 
-
     # initializes our BGP router
     def __init__(self, asn, connections):
         print("Router at AS %s starting up" % asn)
         self.asn = asn
         self.forwarding_table = []
+        self.withdraws = []
 
         # update the neighbors information for each connection, and send handshake
         for relationship in connections:
@@ -64,7 +64,7 @@ class Router:
 
 
     # decides which neighbors to contact based off of our relationship with the sender and our neighbors
-    def contact_neighbors(self, sender, announcement):
+    def contact_neighbors(self, sender, announcement, msg_type="update"):
       # rules:
       # - 1) Update received from a customer: send updates to all other neighbors
       # - 2) Update received from a peer or a provider: only send updates to your customers
@@ -81,7 +81,7 @@ class Router:
         # - or the sender is a customer (rule 1 - all customer updates get sent to everyone)
 
         if ((self.relations[sender] == "cust") or (self.relations[neighbor] == "cust")):
-          self.send(neighbor, json.dumps({"type": "update", "src": self.our_addr(neighbor), "dst": neighbor, "msg": announcement }))
+          self.send(neighbor, json.dumps({"type": msg_type, "src": self.our_addr(neighbor), "dst": neighbor, "msg": announcement }))
 
 
     # decides which functions to call based on the message
@@ -93,7 +93,7 @@ class Router:
         return self.handle_data(sender, msg)
 
       elif msg['type'] == "withdraw":
-        return
+        return self.handle_withdraw(sender, msg)
 
       elif msg['type'] == "dump":
         return self.handle_dump(sender)
@@ -185,16 +185,46 @@ class Router:
 
                   elif (origin_ranks[best_match["origin"]] == origin_ranks[possible["origin"]]):
                     # rule 6
-                    if (ip_to_int(best_netmask["peer"]) > ip_to_int(possible["peer"])):
+                    if (self.ip_to_int(best_match["peer"]) > self.ip_to_int(possible["peer"])):
                       best_netmask = netmask
                       best_match = possible
       
       # if a best path exists forward the message, otherwise send no route message to sender
+      # only forward the message of the source or destination is a customer
       if (best_match):
-        self.send(best_match["peer"], json.dumps(msg))
-      else:
-        self.send(sender, json.dumps({"type": "no route", "src": self.our_addr(sender), "dst": sender, "msg": {} }))
+        src_relationship = self.relations[sender]
+        dst_relationship = self.relations[best_match["peer"]]
 
+        if (src_relationship == "cust" or dst_relationship == "cust"):
+          self.send(best_match["peer"], json.dumps(msg))
+          return
+      
+      self.send(sender, json.dumps({"type": "no route", "src": self.our_addr(sender), "dst": sender, "msg": {} }))
+
+    
+    # handles withdraws by saving them, updating forwarding table, and notifying appropriate neighbors
+    def handle_withdraw(self, sender, msg):
+      # cache withdraw
+      self.withdraws.append(msg)
+
+      # update forwarding table:
+      # create a new forwarding table (save the old one)
+      old_forwarding_table = self.forwarding_table
+      self.forwarding_table = []
+
+      # loop through our old forwarding table:
+      # and for each route mentioned in the withdraw that matches a route in our table, do not include it in our new forwarding table
+      for route in old_forwarding_table:
+        for network in msg["msg"]:
+          if (route["peer"] == sender and
+              route["network"] == network["network"] and
+              route["netmask"] == network["netmask"]):
+            break
+        else: # if the route in our old forwarding table doesn't match a route in the with draw, add it to the new table (keep it)
+          self.forwarding_table.append(route)
+
+      # update appropriate neighbors
+      self.contact_neighbors(sender, msg["msg"], "withdraw")
 
 
 # command line parser, used to create the router
