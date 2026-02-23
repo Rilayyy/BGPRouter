@@ -36,6 +36,17 @@ class Router:
         
         # add the integers together with appropriate bit shift
         return (quads[0] << 24) + (quads[1] << 16) + (quads[2] << 8) + quads[3]
+    
+    # takes an integer and converts it to an ip
+    def int_to_ip(self, n):
+      quads = []
+      
+      # uses repeating % 256 to find ip quads in reverse order
+      for i in range(4):
+        quads.insert(0, str(n % 256))
+        n >>= 8
+      return ".".join(quads)
+
 
     # sends a specified message to a given AS neighbor
     def send(self, network, message):
@@ -125,6 +136,9 @@ class Router:
 
       # decide who to share this with
       self.contact_neighbors(sender, public_announcement)
+
+      # handle aggregation
+      self.handle_aggregation()
     
     # sends our forwarding table to the sender
     def handle_dump(self, sender):
@@ -209,7 +223,7 @@ class Router:
 
       # update forwarding table:
       # create a new forwarding table (save the old one)
-      old_forwarding_table = self.forwarding_table
+      old_forwarding_table = list(self.forwarding_table)
       self.forwarding_table = []
 
       # loop through our old forwarding table:
@@ -225,6 +239,100 @@ class Router:
 
       # update appropriate neighbors
       self.contact_neighbors(sender, msg["msg"], "withdraw")
+
+
+    # handles aggregating appropropriate forwarding table entries
+    def handle_aggregation(self):
+      # aggregation rules:
+      # if there are two or more entries in the forwarding table aggregate if:
+      # 1) they are adjacent numerically
+      # 2) forward to the same next-hop router
+      # 3) have the same attributes (e.g., localpref, origin, etc.)
+
+      # create a new forwarding table (save the old one)
+      old_forwarding_table = list(self.forwarding_table)
+      self.forwarding_table = []
+
+      # loop through our old forwarding table:
+      # for each old route, check if it can be aggregated with any of the other routes
+      for route in old_forwarding_table:
+
+        # include everything for comparison except network and netmask
+        entry = {
+            "peer": route["peer"],
+            "localpref" : route["localpref"],
+            "origin" : route["origin"],
+            "selfOrigin" : route["selfOrigin"],
+            "ASPath" : route["ASPath"]
+        }
+        
+        network = self.ip_to_int(route["network"])
+        netmask = self.ip_to_int(route["netmask"])
+
+
+        for possible_route in old_forwarding_table:
+          # skip if we're comparing to same route
+          if (route == possible_route):
+            continue
+          
+          possible_network = self.ip_to_int(possible_route["network"])
+          possible_netmask = self.ip_to_int(possible_route["netmask"])
+          
+          # include everything for comparison except network and netmask
+          possible_entry = {
+            "peer": possible_route["peer"],
+            "localpref" : possible_route["localpref"],
+            "origin" : possible_route["origin"],
+            "selfOrigin" : possible_route["selfOrigin"],
+            "ASPath" : possible_route["ASPath"]
+          }
+          
+          # rules 2 (peer/next hop matches) and 3 (attributes match)
+          if (entry == possible_entry):
+            # rule 1 check for adjacent IPs:
+            # netmasks need to be the same and last digit after netmask needs to be different
+            if (netmask == possible_netmask):
+              # exclusive or to find differing bits between the networks
+              difference = network ^ possible_network
+
+              # find the first bit after the netmask:
+              # flip all the netmask bits (keep size of 8.8.8.8)
+              # then add 1 to get the value of the boundary bit
+              
+              # example: netmask: 255.255.255.0
+              # flip netmask bits: 0.0.0.255 --> 0.0.0.11111111
+              # add 1: 0.0.1.00000000 --> 256
+              
+              inverted = ~netmask & 0xFFFFFFFF
+              lowest_bit = inverted + 1
+              
+              # make sure the only difference is the bit after the netmask
+              if (difference == lowest_bit):
+                # aggregate:
+                aggregated = possible_entry # keep the attributes that are identical across the networks
+                
+                # shorten the netmask by 1 bit
+                aggregated["netmask"] = self.int_to_ip(netmask - lowest_bit)
+
+                # make the aggregated network the smaller of the 2 networks
+                aggregated["network"] = self.int_to_ip(min(network, possible_network))
+                
+                # remove the 2 old routes
+                old_forwarding_table.remove(route)
+                old_forwarding_table.remove(possible_route)
+
+                # add the new aggregated entry
+                old_forwarding_table.append(aggregated)
+                
+                # update forwarding table
+                self.forwarding_table = list(old_forwarding_table)
+                
+                # call recursively everytime we aggregate (aggregation on top of aggregation might be possible)
+                return self.handle_aggregation()
+        
+        
+        # if no aggregation is possible, keep the current route
+        self.forwarding_table.append(route)
 
 
 # command line parser, used to create the router
