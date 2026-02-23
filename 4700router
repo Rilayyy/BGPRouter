@@ -22,14 +22,27 @@ class Router:
             self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}  }))
 
     def our_addr(self, dst):
+        """
+        Calculates the IP address of this router.
+        :param dst: The IP address of the neighbor
+        :return: The IP address of this router
+        """
         quads = list(int(qdn) for qdn in dst.split('.'))
         quads[3] = 1
         return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
 
     def send(self, network, message):
+        """
+        Helper method that encodes a JSOn string and transmits it over UDP.
+        :param network: The network to send the message to
+        :param message: The message
+        """
         self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
 
     def run(self):
+        """
+        Main event loop of the router.
+        """
         while True:
             socks = select.select(self.sockets.values(), [], [], 0.1)[0]
             for conn in socks:
@@ -57,7 +70,7 @@ class Router:
 
     def _contact_neighbors(self, sender, announcement, msg_type:"update"): 
         """
-        Broadcasts messages to neighbors strictly following BGP transit economics.
+        helper that broadcasts messages to neighbors following BGP rules.
         :params sender: the IP of the neighbor who sent us the message
         :params announcement: the message
         :params msg_type: the type of the message
@@ -71,23 +84,23 @@ class Router:
 
 
     def _create_route_entry(self, payload, peer_ip):
-            """
-            helper top condense the creation of a route entry
-            :params payload: the message
-            :params peer_ip: the IP of the neighbor
-            """
-            network_int = Math.ip_to_number(payload["network"])
-            netmask_int = Math.ip_to_number(payload["netmask"])
+        """
+        helper to condense the creation of a route entry
+        :params payload: the message
+        :params peer_ip: the IP of the neighbor
+        """
+        network_int = Math.ip_to_number(payload["network"])
+        netmask_int = Math.ip_to_number(payload["netmask"])
 
-            return { 
-                "network": network_int, 
-                "netmask": netmask_int, 
-                "localpref": payload["localpref"],
-                "selfOrigin": payload["selfOrigin"],
-                "ASPath": payload["ASPath"], 
-                "origin": payload["origin"],
-                "peer": peer_ip,
-            }
+        return { 
+            "network": network_int, 
+            "netmask": netmask_int, 
+            "localpref": payload["localpref"],
+            "selfOrigin": payload["selfOrigin"],
+            "ASPath": payload["ASPath"], 
+            "origin": payload["origin"],
+            "peer": peer_ip,
+        }
 
     def update(self, message, srcif):
         """
@@ -96,6 +109,13 @@ class Router:
         :params srcif: the IP of the neighbor who sent us the message
         """
         new_route = self._create_route_entry(message["msg"], srcif)
+
+        updated_table = []
+        for route in self.table: 
+            if not (route["network"] == new_route["network"] and route["netmask"] == new_route["netmask"] and route["peer"] == srcif):
+                updated_table.append(route)
+        self.table = updated_table
+
         self.table.append(new_route)
 
         broadcast_path = [self.asn] + new_route["ASPath"]
@@ -161,6 +181,11 @@ class Router:
         self.send(srcif, json.dumps({ "type": "no route", "src": self.our_addr(srcif), "dst": message["src"], "msg": {}})) 
 
     def withdraw(self, message, srcif): 
+        """
+        Handles route revovation messages. Scan routing table, delete any matching routes, and braodcasts the bad news to neighbors. used the routing economics learned.
+        :params message: The message
+        :params srcif: the IP of the neighbor who sent us the message
+        """
         revoked_routes = message["msg"]
 
         for revoked in revoked_routes:
@@ -182,22 +207,111 @@ class Router:
             self._contact_neighbors(srcif, revoked_routes, "withdraw")
 
     def dump(self, message, srcif): 
-            string_table = []
+        """
+        Handles requests from the simulator to view the routers curr knowledge. 
+        :params message: The message
+        :params srcif: the IP of the neighbor who sent us the message
+        """
+        condensed_table = self.condense_table()
 
-            for route in self.table: 
-                string_route = {
-                    "network": Math.number_to_ip(route["network"]), 
-                    "netmask": Math.number_to_ip(route["netmask"]),
-                    "localpref": route["localpref"],
-                    "selfOrigin": route["selfOrigin"],
-                    "ASPath": route["ASPath"], 
-                    "origin": route["origin"],
-                    "peer": route["peer"],
-                }
-                string_table.append(string_route)
+        string_table = []
 
-            self.send(srcif, json.dumps({ "type": "table", "src": self.our_addr(srcif), "dst": srcif, "msg": string_table}))
+        for route in condensed_table: 
+            string_route = {
+                "network": Math.number_to_ip(route["network"]), 
+                "netmask": Math.number_to_ip(route["netmask"]),
+                "localpref": route["localpref"],
+                "selfOrigin": route["selfOrigin"],
+                "ASPath": route["ASPath"], 
+                "origin": route["origin"],
+                "peer": route["peer"],
+            }
+            string_table.append(string_route)
+
+        self.send(srcif, json.dumps({ "type": "table", "src": self.our_addr(srcif), "dst": srcif, "msg": string_table}))
+
+    def can_merge(self, route1, route2):
+        """
+        Evaluated two routes against the established BGP aggregation rules. Return True only if they have all the same attributes, same netamsk, and sit side by side with regards to IP.
+        :params route1: the first route
+        :params route2: the second route
+        """
+        should_continue = False
+        route1_netmask = route1["netmask"]
+        route2_netmask = route2["netmask"]
+
+        if route1 != route2 and route1["peer"] == route2["peer"] and route1["localpref"] == route2["localpref"] and route1["selfOrigin"] == route2["selfOrigin"] and route1["origin"] == route2["origin"] and route1["ASPath"] == route2["ASPath"]:
+
+            if route1_netmask == route2_netmask:
+                # This shifts left by 1 and then ands with 0xFFFFFFFF to get the supermask
+                supermask = (route1_netmask << 1) & 0xFFFFFFFF
+
+                supermask_ip1 = route1["network"] & supermask
+                supermask_ip2 = route2["network"] & supermask
+
+                if supermask_ip1 == supermask_ip2:
+                    should_continue = True
+
+        return should_continue
+
+    def create_merged_routes(self, route1, route2):
+        """
+        Takes two pre checked sibling routes and merges them together. Calculates the newest netmask and base network IP 
+        :params route1: the first route
+        :params route2: the second route
+        :return: the merged route
+        """
+        route1_netmask = route1["netmask"]
+        route2_netmask = route2["netmask"]
+        supermask = (route1_netmask << 1) & 0xFFFFFFFF
+
+        supermask_ip1 = route1["network"] & supermask
+        supermask_ip2 = route2["network"] & supermask
+
+        new_network = min(supermask_ip1, supermask_ip2)
+        new_netmask = supermask
+
+        return {
+            "network": new_network,
+            "netmask": new_netmask,
+            "localpref": route1["localpref"],
+            "selfOrigin": route1["selfOrigin"],
+            "ASPath": route1["ASPath"],
+            "origin": route1["origin"],
+            "peer": route1["peer"],
+        }
+
+    def condense_table(self):
+        """
+        Looks through a temp copy of the routing table. After looking it merdges the sibling routes.
+        :return: the condensed table
+        """
+        temp_table = self.table.copy()
+
+        while True: 
+            merged_this_route = False 
+
+            for i in range(len(temp_table)):
+                for j in range((i + 1), len(temp_table)):
+                    if self.can_merge(temp_table[i], temp_table[j]) is True: 
+                        new_merged_routes = self.create_merged_routes(temp_table[i], temp_table[j])
+
+                        temp_table.pop(j)
+                        temp_table.pop(i)
+
+                        temp_table.append(new_merged_routes)
+
+                        merged_this_route = True
+                        break
+
+                if merged_this_route:
+                    break
+
+            if merged_this_route is False:
+                break
         
+        return temp_table
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='route packets')
     parser.add_argument('asn', type=int, help="AS number of this router")
